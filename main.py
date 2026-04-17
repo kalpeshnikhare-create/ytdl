@@ -185,27 +185,58 @@ def analyze_video(url: str, context: str = ""):
 
     try:
         # ── Step 1: Download ───────────────────────────────────────
+        print(f"[ANALYZE] STEP 1 — downloading video from: {url[:100]}")
         _download_video(url, video_path)
 
-        if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+        if not os.path.exists(video_path):
+            print(f"[ANALYZE] STEP 1 FAIL — file does not exist after download: {video_path}")
             return JSONResponse(status_code=500,
-                content={"error": "Failed to download video from the provided URL."})
+                content={"error": "Failed to download video — file not created."})
 
-        # ── Step 2: Extract frames ─────────────────────────────────
-        duration   = _get_duration(video_path)
+        file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+        if file_size_mb == 0:
+            print(f"[ANALYZE] STEP 1 FAIL — file exists but is 0 bytes")
+            return JSONResponse(status_code=500,
+                content={"error": "Downloaded video file is empty (0 bytes)."})
+
+        print(f"[ANALYZE] STEP 1 OK — file size = {file_size_mb:.2f} MB")
+
+        # ── Step 2: Get duration ───────────────────────────────────
+        print(f"[ANALYZE] STEP 2 — probing video duration via ffprobe")
+        duration = _get_duration(video_path)
+        print(f"[ANALYZE] STEP 2 OK — duration = {duration:.1f}s")
+
+        # ── Step 3: Extract frames ─────────────────────────────────
+        print(f"[ANALYZE] STEP 3 — extracting {len(FRAME_POSITIONS)} frames via ffmpeg")
         frames_out = _extract_frames(video_path, duration, frames_subdir)
+        print(f"[ANALYZE] STEP 3 — extracted {len(frames_out)} frames "
+              f"(expected {len(FRAME_POSITIONS)})")
+
+        for f in frames_out:
+            frame_kb = len(f['data']) * 3 / 4 / 1024   # approx decoded size
+            print(f"[ANALYZE]   frame {f['index']} @ {f['timestamp']}s "
+                  f"({f['position']}) — base64 len={len(f['data'])} "
+                  f"(~{frame_kb:.0f} KB decoded)")
 
         if not frames_out:
+            print(f"[ANALYZE] STEP 3 FAIL — no frames extracted")
             return JSONResponse(status_code=500,
-                content={"error": "ffmpeg could not extract any frames from this video."})
+                content={"error": "ffmpeg could not extract any frames from this video. "
+                                  "Check that ffmpeg is installed in the Docker image."})
 
-        # ── Step 3: Build Claude prompt ────────────────────────────
+        print(f"[ANALYZE] STEP 3 OK — {len(frames_out)} frames ready")
+
+        # ── Step 4: Build Claude prompt ────────────────────────────
+        print(f"[ANALYZE] STEP 4 — building Claude prompt")
         ctx_block = ""
         if context.strip():
             ctx_block = (
                 "━━ ACCOUNT CONTEXT (factor this into your analysis) ━━\n"
                 + context.strip() + "\n\n"
             )
+            print(f"[ANALYZE] STEP 4 — context block length = {len(ctx_block)} chars")
+        else:
+            print(f"[ANALYZE] STEP 4 — no context provided")
 
         frame_labels = "\n".join(
             f"Frame {f['index'] + 1} → {f['timestamp']}s ({f['position']} through video)"
@@ -245,7 +276,10 @@ def analyze_video(url: str, context: str = ""):
             "Give a single rationale sentence and one priority action for the creative team."
         )
 
-        # ── Step 4: Build image content blocks for Claude ──────────
+        print(f"[ANALYZE] STEP 4 OK — prompt length = {len(analysis_prompt)} chars")
+
+        # ── Step 5: Build content blocks ───────────────────────────
+        print(f"[ANALYZE] STEP 5 — building {len(frames_out)} image content blocks")
         content_blocks = [
             {
                 "type":   "image",
@@ -259,16 +293,44 @@ def analyze_video(url: str, context: str = ""):
         ]
         content_blocks.append({"type": "text", "text": analysis_prompt})
 
-        # ── Step 5: Call Claude ────────────────────────────────────
-        client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model      = "claude-sonnet-4-20250514",
-            max_tokens = 1800,
-            messages   = [{"role": "user", "content": content_blocks}]
-        )
+        total_payload_kb = sum(len(f["data"]) for f in frames_out) / 1024
+        print(f"[ANALYZE] STEP 5 OK — total image base64 payload = "
+              f"{total_payload_kb:.0f} KB across {len(frames_out)} blocks")
+
+        # ── Step 6: Call Claude ────────────────────────────────────
+        print(f"[ANALYZE] STEP 6 — calling Claude API "
+              f"(model=claude-sonnet-4-20250514, max_tokens=1800)")
+        print(f"[ANALYZE] STEP 6 — ANTHROPIC_API_KEY set = "
+              f"{'YES (len=' + str(len(ANTHROPIC_API_KEY)) + ')' if ANTHROPIC_API_KEY else 'NO — THIS WILL FAIL'}")
+
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        try:
+            response = client.messages.create(
+                model      = "claude-sonnet-4-20250514",
+                max_tokens = 1800,
+                messages   = [{"role": "user", "content": content_blocks}]
+            )
+            print(f"[ANALYZE] STEP 6 OK — response received")
+            print(f"[ANALYZE] STEP 6 — stop_reason = {response.stop_reason}")
+            print(f"[ANALYZE] STEP 6 — content blocks in response = {len(response.content)}")
+        except anthropic.APIStatusError as api_err:
+            print(f"[ANALYZE] STEP 6 FAIL — APIStatusError: "
+                  f"status={api_err.status_code} body={str(api_err.body)[:400]}")
+            return JSONResponse(status_code=500,
+                content={"error": f"Claude API error {api_err.status_code}: {str(api_err.body)[:300]}"})
+        except anthropic.APIConnectionError as conn_err:
+            print(f"[ANALYZE] STEP 6 FAIL — connection error: {str(conn_err)}")
+            return JSONResponse(status_code=500,
+                content={"error": f"Claude connection error: {str(conn_err)}"})
 
         analysis_text = response.content[0].text if response.content else ""
+        print(f"[ANALYZE] STEP 6 — analysis text length = {len(analysis_text)} chars")
 
+        if not analysis_text:
+            print(f"[ANALYZE] STEP 6 WARN — empty analysis text returned by Claude")
+
+        print(f"[ANALYZE] COMPLETE — returning result to GAS")
         return JSONResponse({
             "analysis":    analysis_text,
             "frame_count": len(frames_out),
@@ -276,19 +338,29 @@ def analyze_video(url: str, context: str = ""):
         })
 
     except anthropic.APIError as e:
+        print(f"[ANALYZE] EXCEPTION — anthropic.APIError: {str(e)}")
         return JSONResponse(status_code=500,
             content={"error": f"Claude API error: {str(e)}"})
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as te:
+        print(f"[ANALYZE] EXCEPTION — TimeoutExpired: {str(te)}")
         return JSONResponse(status_code=504,
             content={"error": "Video processing timed out. The video may be too large."})
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[ANALYZE] EXCEPTION — {type(e).__name__}: {str(e)}")
+        print(f"[ANALYZE] TRACEBACK:\n{tb}")
+        return JSONResponse(status_code=500,
+            content={"error": f"{type(e).__name__}: {str(e)}"})
     finally:
         try:
-            if os.path.exists(video_path):    os.remove(video_path)
+            if os.path.exists(video_path):
+                os.remove(video_path)
+                print(f"[ANALYZE] CLEANUP — removed video file")
         except Exception: pass
         try:
             shutil.rmtree(frames_subdir, ignore_errors=True)
+            print(f"[ANALYZE] CLEANUP — removed frames directory")
         except Exception: pass
     """
     Download a video from `url`, extract 6 key frames using ffmpeg,
