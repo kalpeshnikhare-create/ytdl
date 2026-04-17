@@ -25,8 +25,7 @@ FRAME_POSITIONS = [0.05, 0.20, 0.35, 0.55, 0.75, 0.92]
 # Anthropic API key — set this as an environment variable in Render dashboard
 # Render → Your Service → Environment → Add Environment Variable
 # Key: ANTHROPIC_API_KEY   Value: sk-ant-...
-ANTHROPIC_API_KEY = os.environ.get("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", "")
-
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 @app.get("/")
 def home():
