@@ -9,7 +9,7 @@ app = FastAPI()
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-BASE_URL = "https://your-app.onrender.com"  # change later
+BASE_URL = "https://instagram-downloader-qiht.onrender.com"
 
 @app.get("/")
 def home():
