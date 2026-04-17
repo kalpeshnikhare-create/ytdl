@@ -78,16 +78,11 @@ def extract_frames(url: str):
     os.makedirs(frames_subdir, exist_ok=True)
 
     try:
-        # Use yt-dlp if the URL looks like a hosted video (mp4 direct link)
-        # or a platform URL. For direct .mp4 links, wget is faster.
+       # Use Python's urllib for direct MP4 links (no external tools needed).
+        # Fall back to yt-dlp for Instagram/platform URLs.
         if url.endswith(".mp4") or "/file/" in url:
-            # Direct MP4 download via subprocess wget
-            dl_cmd = ["wget", "-q", "-O", video_path, url]
-            result = subprocess.run(dl_cmd, capture_output=True, timeout=60)
-            if result.returncode != 0:
-                # Fallback to curl if wget fails
-                curl_cmd = ["curl", "-sL", "-o", video_path, url]
-                subprocess.run(curl_cmd, capture_output=True, timeout=60)
+            import urllib.request
+            urllib.request.urlretrieve(url, video_path)
         else:
             yt_cmd = ["yt-dlp", "-f", "best", "-o", video_path, url]
             subprocess.run(yt_cmd, stdout=subprocess.DEVNULL,
