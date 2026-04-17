@@ -15,6 +15,10 @@ BASE_URL = "https://instagram-downloader-qiht.onrender.com"
 def home():
     return {"status": "running"}
 
+from fastapi.responses import FileResponse
+
+from fastapi.responses import FileResponse
+
 @app.get("/download")
 def download(url: str):
     filename = f"{uuid.uuid4()}.mp4"
@@ -29,11 +33,8 @@ def download(url: str):
 
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    return JSONResponse({
-        "download_url": f"{BASE_URL}/file/{filename}"
-    })
-
-@app.get("/file/{filename}")
-def get_file(filename: str):
-    path = os.path.join(DOWNLOAD_DIR, filename)
-    return FileResponse(path, media_type="video/mp4", filename=filename)
+    return FileResponse(
+        filepath,
+        media_type="video/mp4",
+        filename="instagram_video.mp4"
+    )
