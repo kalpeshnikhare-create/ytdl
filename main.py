@@ -18,9 +18,11 @@ os.makedirs(FRAMES_DIR,   exist_ok=True)
 
 BASE_URL = "https://instagram-downloader-qiht.onrender.com"
 
-# Timestamps as fractions of total duration.
-# Chosen to capture: hook, early body, mid, product zone, late body, CTA.
+# Used only by the /frames (testing) endpoint — fixed 6 positions as fractions of duration.
 FRAME_POSITIONS = [0.05, 0.20, 0.35, 0.55, 0.75, 0.92]
+
+# Maximum number of frames (seconds) sent to Claude in /analyze.
+MAX_ANALYZE_FRAMES = 60
 
 # Anthropic API key — set this as an environment variable in Render dashboard
 # Render → Your Service → Environment → Add Environment Variable
@@ -82,14 +84,13 @@ def _get_duration(video_path: str) -> float:
         return 10.0
 
 
-def _extract_frames(video_path: str, duration: float, frames_subdir: str) -> list:
+def _extract_frames(video_path: str, timestamps: list, frames_subdir: str) -> list:
     """
-    Extract frames at FRAME_POSITIONS and return list of dicts:
-    { index, timestamp, position, data (base64), mediaType }
+    Extract frames at the given list of timestamps (in seconds) and return list of dicts:
+    { index, timestamp, data (base64), mediaType }
     """
     frames_out = []
-    for i, position in enumerate(FRAME_POSITIONS):
-        timestamp  = round(max(0.0, min(position * duration, duration - 0.1)), 1)
+    for i, timestamp in enumerate(timestamps):
         frame_path = os.path.join(frames_subdir, f"frame_{i}.jpg")
 
         ffmpeg_cmd = [
@@ -114,7 +115,6 @@ def _extract_frames(video_path: str, duration: float, frames_subdir: str) -> lis
         frames_out.append({
             "index":     i,
             "timestamp": timestamp,
-            "position":  f"{round(position * 100)}%",
             "data":      frame_b64,
             "mediaType": "image/jpeg"
         })
@@ -125,7 +125,7 @@ def _extract_frames(video_path: str, duration: float, frames_subdir: str) -> lis
 def extract_frames_endpoint(url: str):
     """
     Download video and return base64 frames only (no Claude call).
-    Kept for testing purposes.
+    Uses fixed 6 positions for quick testing — kept unchanged.
     """
     video_path    = os.path.join(DOWNLOAD_DIR, f"{uuid.uuid4()}.mp4")
     frames_subdir = os.path.join(FRAMES_DIR, str(uuid.uuid4()))
@@ -138,8 +138,14 @@ def extract_frames_endpoint(url: str):
             return JSONResponse(status_code=500,
                 content={"error": "Failed to download video from the provided URL."})
 
-        duration   = _get_duration(video_path)
-        frames_out = _extract_frames(video_path, duration, frames_subdir)
+        duration = _get_duration(video_path)
+
+        # /frames still uses the original 6 fixed positions
+        timestamps = [
+            round(max(0.0, min(p * duration, duration - 0.1)), 1)
+            for p in FRAME_POSITIONS
+        ]
+        frames_out = _extract_frames(video_path, timestamps, frames_subdir)
 
         if not frames_out:
             return JSONResponse(status_code=500,
@@ -166,14 +172,20 @@ def analyze_video(url: str, context: str = ""):
     """
     Full pipeline in one endpoint:
       1. Download video from `url`
-      2. Extract 6 frames via ffmpeg
+      2. Extract 1 frame per second (integer seconds: 0, 1, 2 … duration-1), capped at 60 frames
       3. Send frames as images to Claude
       4. Return structured analysis text
 
     `context` — optional account context string passed from GAS
                 (URL-encoded, injected into the Claude prompt)
 
-    Response: { "analysis": "...", "frame_count": 6, "duration": 15 }
+    Response:
+    {
+      "analysis":    "...",
+      "frame_count": 55,
+      "duration":    55,
+      "warning":     null | "Video exceeds 60 seconds (Xs). Analysis is based on the first 60 seconds only."
+    }
     """
     if not ANTHROPIC_API_KEY:
         return JSONResponse(status_code=500,
@@ -206,17 +218,34 @@ def analyze_video(url: str, context: str = ""):
         duration = _get_duration(video_path)
         print(f"[ANALYZE] STEP 2 OK — duration = {duration:.1f}s")
 
-        # ── Step 3: Extract frames ─────────────────────────────────
-        print(f"[ANALYZE] STEP 3 — extracting {len(FRAME_POSITIONS)} frames via ffmpeg")
-        frames_out = _extract_frames(video_path, duration, frames_subdir)
+        # ── Step 3: Compute per-second timestamps, cap at 60 ──────
+        total_seconds = int(duration)  # e.g. 55.7s → 55
+        capped        = total_seconds > MAX_ANALYZE_FRAMES
+        num_frames    = min(total_seconds, MAX_ANALYZE_FRAMES)
+
+        # Integer seconds: 0, 1, 2 … num_frames-1  (last = duration - 1 when uncapped)
+        timestamps = list(range(0, num_frames))
+
+        warning = None
+        if capped:
+            warning = (
+                f"Video exceeds {MAX_ANALYZE_FRAMES} seconds "
+                f"({total_seconds}s total). "
+                f"Analysis is based on the first {MAX_ANALYZE_FRAMES} seconds only."
+            )
+            print(f"[ANALYZE] STEP 3 — {warning}")
+
+        print(f"[ANALYZE] STEP 3 — extracting {num_frames} frames "
+              f"(0s – {num_frames - 1}s, 1 frame/sec)")
+
+        frames_out = _extract_frames(video_path, timestamps, frames_subdir)
         print(f"[ANALYZE] STEP 3 — extracted {len(frames_out)} frames "
-              f"(expected {len(FRAME_POSITIONS)})")
+              f"(expected {num_frames})")
 
         for f in frames_out:
-            frame_kb = len(f['data']) * 3 / 4 / 1024   # approx decoded size
+            frame_kb = len(f['data']) * 3 / 4 / 1024
             print(f"[ANALYZE]   frame {f['index']} @ {f['timestamp']}s "
-                  f"({f['position']}) — base64 len={len(f['data'])} "
-                  f"(~{frame_kb:.0f} KB decoded)")
+                  f"— base64 len={len(f['data'])} (~{frame_kb:.0f} KB decoded)")
 
         if not frames_out:
             print(f"[ANALYZE] STEP 3 FAIL — no frames extracted")
@@ -238,8 +267,10 @@ def analyze_video(url: str, context: str = ""):
         else:
             print(f"[ANALYZE] STEP 4 — no context provided")
 
+        analyzed_duration = num_frames  # seconds covered (0 … num_frames-1)
+
         frame_labels = "\n".join(
-            f"Frame {f['index'] + 1} → {f['timestamp']}s ({f['position']} through video)"
+            f"Frame {f['index'] + 1} → {f['timestamp']}s"
             for f in frames_out
         )
 
@@ -247,30 +278,44 @@ def analyze_video(url: str, context: str = ""):
             ctx_block +
             "You are a senior performance creative strategist for mCaffeine, a D2C skincare brand "
             "targeting primarily women aged 18–34 in India, running ads on Meta (Facebook & Instagram).\n\n"
-            f"You have been given {len(frames_out)} key frames extracted from a video ad "
-            f"(total duration: {round(duration)} seconds). "
-            f"Frame timestamps:\n{frame_labels}\n\n"
-            "Perform a detailed frame-by-frame analysis. Reference what you actually see in specific "
-            "frames — visuals, text overlays, talent, product shots, transitions, pacing, and messaging.\n\n"
+            f"You have been given {len(frames_out)} frames extracted from a video ad at 1 frame per second "
+            f"(Frame 1 = 0s, Frame {len(frames_out)} = {len(frames_out) - 1}s). "
+            f"Total analyzed duration: {analyzed_duration} seconds.\n"
+        )
+
+        if warning:
+            analysis_prompt += (
+                f"NOTE: The original video is longer than {MAX_ANALYZE_FRAMES} seconds. "
+                f"Your analysis covers only the first {MAX_ANALYZE_FRAMES} seconds.\n"
+            )
+
+        analysis_prompt += (
+            f"\nFrame timestamps:\n{frame_labels}\n\n"
+            "Each frame represents exactly 1 second of the video. Use the frame index and timestamp "
+            "to reference specific moments precisely in your analysis.\n\n"
+            "Perform a detailed analysis referencing what you actually see in specific frames — "
+            "visuals, text overlays, talent, product shots, transitions, pacing, and messaging.\n\n"
             "Structure your response using EXACTLY these numbered headings:\n\n"
             "1. HOOK (0–3 SECONDS)\n"
-            "Describe Frame 1 in detail. Is it thumb-stopping? Does it immediately create curiosity, "
+            "Describe Frames 1–4 in detail. Is it thumb-stopping? Does it immediately create curiosity, "
             "emotion, or relevance? What technique is used (bold claim, question, visual contrast, etc.)?\n\n"
             "2. CREATIVE STRUCTURE\n"
             "Describe the overall narrative arc across all frames. Does it follow Problem → Solution, "
             "Before → After, Testimonial, Tutorial, or another format? "
             "How well does the structure serve the product?\n\n"
             "3. PACING & EDITING\n"
-            "Based on what you see across frames, comment on visual density, text overlay frequency, "
-            "and whether the pacing matches how the target audience consumes Reels/Feed content.\n\n"
+            "With 1 frame per second, comment on visual density, scene changes, text overlay frequency, "
+            "and whether the pacing matches how the target audience consumes Reels/Feed content. "
+            "Cite specific second-by-second transitions where relevant.\n\n"
             "4. MESSAGING & CTA\n"
-            "What is the primary message? Is the value proposition clear and when does it appear? "
+            "What is the primary message? Is the value proposition clear and at which second does it appear? "
             "Identify the CTA frame — how is it framed and is it compelling?\n\n"
             "5. WHAT'S WORKING\n"
             "List exactly 3 specific creative elements that are effective, referencing the frame number "
-            "and timestamp.\n\n"
+            "and timestamp (in seconds).\n\n"
             "6. WHAT CAN BE IMPROVED\n"
-            "List exactly 3 specific, actionable improvements with expected impact, referencing frames.\n\n"
+            "List exactly 3 specific, actionable improvements with expected impact, referencing frames "
+            "and timestamps (in seconds).\n\n"
             "7. OVERALL SCORE\n"
             "Rate this ad out of 10 for Meta performance potential. "
             "Give a single rationale sentence and one priority action for the creative team."
@@ -299,7 +344,7 @@ def analyze_video(url: str, context: str = ""):
 
         # ── Step 6: Call Claude ────────────────────────────────────
         print(f"[ANALYZE] STEP 6 — calling Claude API "
-              f"(model=claude-sonnet-4-20250514, max_tokens=1800)")
+              f"(model=claude-sonnet-4-20250514, max_tokens=3500)")
         print(f"[ANALYZE] STEP 6 — ANTHROPIC_API_KEY set = "
               f"{'YES (len=' + str(len(ANTHROPIC_API_KEY)) + ')' if ANTHROPIC_API_KEY else 'NO — THIS WILL FAIL'}")
 
@@ -308,7 +353,7 @@ def analyze_video(url: str, context: str = ""):
         try:
             response = client.messages.create(
                 model      = "claude-sonnet-4-20250514",
-                max_tokens = 1800,
+                max_tokens = 3500,
                 messages   = [{"role": "user", "content": content_blocks}]
             )
             print(f"[ANALYZE] STEP 6 OK — response received")
@@ -334,7 +379,8 @@ def analyze_video(url: str, context: str = ""):
         return JSONResponse({
             "analysis":    analysis_text,
             "frame_count": len(frames_out),
-            "duration":    round(duration)
+            "duration":    round(duration),
+            "warning":     warning
         })
 
     except anthropic.APIError as e:
@@ -362,130 +408,3 @@ def analyze_video(url: str, context: str = ""):
             shutil.rmtree(frames_subdir, ignore_errors=True)
             print(f"[ANALYZE] CLEANUP — removed frames directory")
         except Exception: pass
-    """
-    Download a video from `url`, extract 6 key frames using ffmpeg,
-    and return them as base64-encoded JPEGs with timestamps.
-
-    Response shape:
-    {
-      "frames": [
-        {
-          "index": 0,
-          "timestamp": 0.5,
-          "position": "5%",
-          "data": "<base64 JPEG string>",
-          "mediaType": "image/jpeg"
-        },
-        ...
-      ],
-      "duration": 15
-    }
-    """
-    # ── Step 1: Download the video to a temp file ──────────────────
-    video_filename = f"{uuid.uuid4()}.mp4"
-    video_path     = os.path.join(DOWNLOAD_DIR, video_filename)
-    frames_subdir  = os.path.join(FRAMES_DIR, str(uuid.uuid4()))
-    os.makedirs(frames_subdir, exist_ok=True)
-
-    try:
-       # Use Python's urllib for direct MP4 links (no external tools needed).
-        # Fall back to yt-dlp for Instagram/platform URLs.
-        if url.endswith(".mp4") or "/file/" in url:
-            import urllib.request
-            urllib.request.urlretrieve(url, video_path)
-        else:
-            yt_cmd = ["yt-dlp", "-f", "best", "-o", video_path, url]
-            subprocess.run(yt_cmd, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=120)
-
-        if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
-            return JSONResponse(
-                status_code=500,
-                content={"error": "Failed to download video from the provided URL."}
-            )
-
-        # ── Step 2: Get video duration via ffprobe ─────────────────
-        probe_cmd = [
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            video_path
-        ]
-        probe_result = subprocess.run(probe_cmd, capture_output=True,
-                                      text=True, timeout=30)
-
-        duration = 10.0   # fallback if probe fails
-        try:
-            probe_data = json.loads(probe_result.stdout)
-            duration   = float(probe_data.get("format", {}).get("duration", 10.0))
-        except Exception:
-            pass  # use fallback duration
-
-        # ── Step 3: Extract frames at each position ────────────────
-        frames_out = []
-        for i, position in enumerate(FRAME_POSITIONS):
-            timestamp  = max(0.0, min(position * duration, duration - 0.1))
-            timestamp  = round(timestamp, 1)
-            frame_path = os.path.join(frames_subdir, f"frame_{i}.jpg")
-
-            ffmpeg_cmd = [
-                "ffmpeg",
-                "-ss",       str(timestamp),   # seek BEFORE input for speed
-                "-i",        video_path,
-                "-frames:v", "1",              # extract exactly 1 frame
-                "-vf",       "scale=720:-2",   # cap width at 720px, keep aspect ratio
-                "-q:v",      "3",              # JPEG quality (1=best, 31=worst; 3 is good)
-                "-y",                          # overwrite without prompting
-                frame_path
-            ]
-            subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=30)
-
-            if not os.path.exists(frame_path):
-                # Skip frames that failed to extract rather than aborting
-                continue
-
-            with open(frame_path, "rb") as f:
-                frame_b64 = base64.b64encode(f.read()).decode("utf-8")
-
-            frames_out.append({
-                "index":     i,
-                "timestamp": timestamp,
-                "position":  f"{round(position * 100)}%",
-                "data":      frame_b64,
-                "mediaType": "image/jpeg"
-            })
-
-        if not frames_out:
-            return JSONResponse(
-                status_code=500,
-                content={"error": "ffmpeg could not extract any frames from this video."}
-            )
-
-        return JSONResponse({
-            "frames":   frames_out,
-            "duration": round(duration)
-        })
-
-    except subprocess.TimeoutExpired:
-        return JSONResponse(
-            status_code=504,
-            content={"error": "Video processing timed out. The video may be too large."}
-        )
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
-    finally:
-        # ── Cleanup temp files regardless of success or failure ─────
-        try:
-            if os.path.exists(video_path):
-                os.remove(video_path)
-        except Exception:
-            pass
-        try:
-            if os.path.exists(frames_subdir):
-                shutil.rmtree(frames_subdir, ignore_errors=True)
-        except Exception:
-            pass
