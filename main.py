@@ -11,6 +11,16 @@ import anthropic
 
 app = FastAPI()
 
+# Auto-update yt-dlp on startup to keep Instagram extractor working
+try:
+    update_result = subprocess.run(
+        ["yt-dlp", "-U"],
+        capture_output=True, text=True, timeout=60
+    )
+    print(f"[STARTUP] yt-dlp update: {update_result.stdout.strip() or update_result.stderr.strip()}")
+except Exception as e:
+    print(f"[STARTUP] yt-dlp update failed: {e}")
+
 DOWNLOAD_DIR = "downloads"
 FRAMES_DIR   = "frames"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -41,6 +51,9 @@ def download(url: str):
     cmd = [
         "yt-dlp",
         "-f", "best",
+        "--extractor-args", "instagram:app=android",
+        "--no-check-certificates",
+        "--user-agent", "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36",
         "-o", filepath,
         url
     ]
@@ -81,7 +94,15 @@ def _download_video(url: str, video_path: str):
         except urllib.error.HTTPError as e:
             raise ValueError(f"HTTPError fetching video file: {e.code} {e.reason} — file may have expired on server")
     else:
-        yt_cmd = ["yt-dlp", "-f", "best", "-o", video_path, url]
+        yt_cmd = [
+            "yt-dlp",
+            "-f", "best",
+            "--extractor-args", "instagram:app=android",
+            "--no-check-certificates",
+            "--user-agent", "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36",
+            "-o", video_path,
+            url
+        ]
         subprocess.run(yt_cmd, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=120)
 
