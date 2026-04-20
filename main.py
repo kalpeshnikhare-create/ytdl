@@ -11,7 +11,9 @@ import anthropic
 
 app = FastAPI()
 
-# Auto-update yt-dlp on startup to keep Instagram extractor working
+COOKIES_PATH = "/tmp/instagram_cookies.txt"
+
+# Auto-update yt-dlp on startup
 try:
     update_result = subprocess.run(
         ["yt-dlp", "-U"],
@@ -20,6 +22,15 @@ try:
     print(f"[STARTUP] yt-dlp update: {update_result.stdout.strip() or update_result.stderr.strip()}")
 except Exception as e:
     print(f"[STARTUP] yt-dlp update failed: {e}")
+
+# Write Instagram cookies from environment variable to disk
+_cookies_env = os.environ.get("INSTAGRAM_COOKIES", "")
+if _cookies_env:
+    with open(COOKIES_PATH, "w") as _f:
+        _f.write(_cookies_env)
+    print(f"[STARTUP] Instagram cookies written to {COOKIES_PATH}")
+else:
+    print(f"[STARTUP] WARNING — INSTAGRAM_COOKIES env var not set. Downloads may fail.")
 
 DOWNLOAD_DIR = "downloads"
 FRAMES_DIR   = "frames"
@@ -51,6 +62,7 @@ def download(url: str):
     cmd = [
         "yt-dlp",
         "-f", "best",
+        "--cookies", COOKIES_PATH,
         "--extractor-args", "instagram:app=android",
         "--no-check-certificates",
         "--user-agent", "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36",
@@ -97,6 +109,7 @@ def _download_video(url: str, video_path: str):
         yt_cmd = [
             "yt-dlp",
             "-f", "best",
+            "--cookies", COOKIES_PATH,
             "--extractor-args", "instagram:app=android",
             "--no-check-certificates",
             "--user-agent", "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36",
