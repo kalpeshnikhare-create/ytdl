@@ -44,7 +44,17 @@ def download(url: str):
         "-o", filepath,
         url
     ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "yt-dlp failed to download video",
+                "stderr": result.stderr.decode(errors="replace")[-500:]
+            }
+        )
+
     return JSONResponse({
         "download_url": f"{BASE_URL}/file/{filename}"
     })
@@ -61,7 +71,15 @@ def get_file(filename: str):
 def _download_video(url: str, video_path: str):
     """Download a video to video_path. Uses urllib for direct MP4s, yt-dlp for platform URLs."""
     if url.endswith(".mp4") or "/file/" in url:
-        urllib.request.urlretrieve(url, video_path)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                if response.status != 200:
+                    raise ValueError(f"File server returned HTTP {response.status}")
+                with open(video_path, "wb") as out_file:
+                    shutil.copyfileobj(response, out_file)
+        except urllib.error.HTTPError as e:
+            raise ValueError(f"HTTPError fetching video file: {e.code} {e.reason} — file may have expired on server")
     else:
         yt_cmd = ["yt-dlp", "-f", "best", "-o", video_path, url]
         subprocess.run(yt_cmd, stdout=subprocess.DEVNULL,
