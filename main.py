@@ -8,6 +8,7 @@ import json
 import shutil
 import urllib.request
 import anthropic
+from transcriber import transcribe_with_timestamps
 
 app = FastAPI()
 
@@ -173,6 +174,28 @@ def _extract_frames(video_path: str, timestamps: list, frames_subdir: str) -> li
     return frames_out
 
 
+def _extract_audio(video_path: str, audio_path: str) -> bool:
+    """
+    Extract audio from video file using ffmpeg.
+    Returns True if audio file was created and is non-empty, False otherwise.
+    """
+    cmd = [
+        "ffmpeg",
+        "-i", video_path,
+        "-vn",                  # no video
+        "-acodec", "mp3",
+        "-q:a", "2",            # high quality
+        "-y",                   # overwrite
+        audio_path
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60)
+    if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+        print(f"[AUDIO] ffmpeg audio extraction failed: {result.stderr.decode(errors='replace')[-300:]}")
+        return False
+    print(f"[AUDIO] Extracted audio: {os.path.getsize(audio_path) / 1024:.1f} KB")
+    return True
+
+
 @app.get("/frames")
 def extract_frames_endpoint(url: str):
     """
@@ -307,6 +330,51 @@ def analyze_video(url: str, context: str = ""):
 
         print(f"[ANALYZE] STEP 3 OK — {len(frames_out)} frames ready")
 
+        # ── Step 3b: Extract audio + transcribe ───────────────────
+        transcript_data   = None
+        transcript_block  = ""
+        audio_path        = video_path.replace(".mp4", ".mp3")
+
+        print(f"[ANALYZE] STEP 3b — extracting audio for transcription")
+        try:
+            audio_ok = _extract_audio(video_path, audio_path)
+            if audio_ok:
+                print(f"[ANALYZE] STEP 3b — audio extracted, calling Whisper API")
+                transcript_data = transcribe_with_timestamps(audio_path)
+                print(f"[ANALYZE] STEP 3b OK — transcript length = "
+                      f"{len(transcript_data.get('full_text', ''))} chars, "
+                      f"{len(transcript_data.get('second_by_second', []))} seconds mapped")
+
+                # Format transcript for Claude prompt
+                sbs = transcript_data.get("second_by_second", [])
+                if sbs:
+                    sbs_lines = "\n".join(
+                        f"  {entry['second']}s: {entry['text']}"
+                        for entry in sbs
+                    )
+                    transcript_block = (
+                        "━━ AUDIO TRANSCRIPT (second-by-second) ━━\n"
+                        f"Full text: {transcript_data.get('full_text', '').strip()}\n\n"
+                        f"Timestamped breakdown:\n{sbs_lines}\n\n"
+                    )
+                else:
+                    transcript_block = (
+                        "━━ AUDIO TRANSCRIPT ━━\n"
+                        f"{transcript_data.get('full_text', '').strip()}\n\n"
+                    )
+            else:
+                print(f"[ANALYZE] STEP 3b WARN — audio extraction failed, proceeding without transcript")
+                transcript_block = "━━ AUDIO TRANSCRIPT ━━\n[Audio could not be extracted from this video]\n\n"
+        except Exception as te:
+            print(f"[ANALYZE] STEP 3b WARN — transcription failed: {te}. Proceeding without transcript.")
+            transcript_block = f"━━ AUDIO TRANSCRIPT ━━\n[Transcription failed: {str(te)}]\n\n"
+        finally:
+            try:
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+            except Exception:
+                pass
+
         # ── Step 4: Build Claude prompt ────────────────────────────
         print(f"[ANALYZE] STEP 4 — building Claude prompt")
         ctx_block = ""
@@ -328,11 +396,15 @@ def analyze_video(url: str, context: str = ""):
 
         analysis_prompt = (
             ctx_block +
+            transcript_block +
             "You are a senior performance creative strategist for mCaffeine, a D2C skincare brand "
             "targeting primarily women aged 18–34 in India, running ads on Meta (Facebook & Instagram).\n\n"
             f"You have been given {len(frames_out)} frames extracted from a video ad at 1 frame per second "
             f"(Frame 1 = 0s, Frame {len(frames_out)} = {len(frames_out) - 1}s). "
             f"Total analyzed duration: {analyzed_duration} seconds.\n"
+            "You also have a second-by-second audio transcript of the same video (provided above). "
+            "Cross-reference what is SAID (transcript) with what is SHOWN (frames) at each moment — "
+            "alignment or misalignment between audio and visuals is a key creative signal.\n"
         )
 
         if warning:
@@ -344,9 +416,11 @@ def analyze_video(url: str, context: str = ""):
         analysis_prompt += (
             f"\nFrame timestamps:\n{frame_labels}\n\n"
             "Each frame represents exactly 1 second of the video. Use the frame index and timestamp "
-            "to reference specific moments precisely in your analysis.\n\n"
-            "Perform a detailed analysis referencing what you actually see in specific frames — "
-            "visuals, text overlays, talent, product shots, transitions, pacing, and messaging.\n\n"
+            "to reference specific moments precisely in your analysis. "
+            "Where the transcript provides spoken words at that second, quote them directly.\n\n"
+            "Perform a detailed analysis referencing what you actually see in specific frames AND "
+            "what is spoken at those moments — visuals, text overlays, voiceover, talent dialogue, "
+            "product shots, transitions, pacing, and messaging.\n\n"
             "Structure your response using EXACTLY these numbered headings:\n\n"
             "1. HOOK (0–3 SECONDS)\n"
             "Describe Frames 1–4 in detail. Is it thumb-stopping? Does it immediately create curiosity, "
