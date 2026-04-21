@@ -1,6 +1,8 @@
 fastapi
+uvicorn[standard]
 yt-dlp
-uvicorn
+openai
+anthropic
 ffmpeg-python
 Pillow
 requests
