@@ -202,7 +202,7 @@ def _extract_audio(video_path: str, audio_path: str) -> bool:
         return False
     size_kb = os.path.getsize(audio_path) / 1024
     print(f"[AUDIO] Extracted audio — {size_kb:.1f} KB at 16kHz mono WAV")
-return True
+    return True
 
 
 @app.get("/frames")
