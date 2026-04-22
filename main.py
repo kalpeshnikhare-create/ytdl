@@ -50,7 +50,11 @@ MAX_ANALYZE_FRAMES = 60
 # Render → Your Service → Environment → Add Environment Variable
 # Key: ANTHROPIC_API_KEY   Value: sk-ant-...
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
 
+if not OPENAI_API_KEY:
+    print("[STARTUP] WARNING — OPENAI_API_KEY not set. Audio transcription will be skipped.")
+    
 @app.get("/")
 def home():
     return {"status": "running"}
@@ -176,24 +180,29 @@ def _extract_frames(video_path: str, timestamps: list, frames_subdir: str) -> li
 
 def _extract_audio(video_path: str, audio_path: str) -> bool:
     """
-    Extract audio from video file using ffmpeg.
+    Extract audio from video file using ffmpeg as 16kHz mono WAV.
+    WAV/PCM needs no external codec, works on all ffmpeg builds, and is Whisper's native rate.
     Returns True if audio file was created and is non-empty, False otherwise.
     """
     cmd = [
         "ffmpeg",
         "-i", video_path,
-        "-vn",                  # no video
-        "-acodec", "mp3",
-        "-q:a", "2",            # high quality
-        "-y",                   # overwrite
+        "-vn",                   # strip video
+        "-acodec", "pcm_s16le",  # PCM — no external codec needed
+        "-ar", "16000",          # 16kHz — Whisper's native sample rate
+        "-ac", "1",              # mono
+        "-y",                    # overwrite
         audio_path
     ]
     result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60)
     if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
-        print(f"[AUDIO] ffmpeg audio extraction failed: {result.stderr.decode(errors='replace')[-300:]}")
+        print(f"[AUDIO] ffmpeg extraction failed.\n"
+              f"[AUDIO] Command: {' '.join(cmd)}\n"
+              f"[AUDIO] stderr: {result.stderr.decode(errors='replace')[-500:]}")
         return False
-    print(f"[AUDIO] Extracted audio: {os.path.getsize(audio_path) / 1024:.1f} KB")
-    return True
+    size_kb = os.path.getsize(audio_path) / 1024
+    print(f"[AUDIO] Extracted audio — {size_kb:.1f} KB at 16kHz mono WAV")
+return True
 
 
 @app.get("/frames")
@@ -333,7 +342,7 @@ def analyze_video(url: str, context: str = ""):
         # ── Step 3b: Extract audio + transcribe ───────────────────
         transcript_data   = None
         transcript_block  = ""
-        audio_path        = video_path.replace(".mp4", ".mp3")
+        audio_path        = os.path.splitext(video_path)[0] + ".wav"
 
         print(f"[ANALYZE] STEP 3b — extracting audio for transcription")
         try:
@@ -626,3 +635,70 @@ def analyze_video(url: str, context: str = ""):
             shutil.rmtree(frames_subdir, ignore_errors=True)
             print(f"[ANALYZE] CLEANUP — removed frames directory")
         except Exception: pass
+
+@app.get("/test-audio")
+def test_audio(url: str):
+    """
+    Diagnostic endpoint — tests only audio extraction + transcription.
+    Skips frames and Claude entirely. Use to verify Whisper pipeline in isolation.
+    """
+    video_path = os.path.join(DOWNLOAD_DIR, f"{uuid.uuid4()}.mp4")
+    audio_path = os.path.splitext(video_path)[0] + ".wav"
+
+    results = {
+        "step1_download":    None,
+        "step2_audio":       None,
+        "step3_transcript":  None,
+        "error":             None
+    }
+
+    try:
+        # Step 1: Download
+        print(f"[TEST-AUDIO] Downloading: {url[:100]}")
+        _download_video(url, video_path)
+
+        if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+            results["step1_download"] = "FAIL — video not downloaded"
+            return JSONResponse(results)
+
+        size_mb = os.path.getsize(video_path) / (1024 * 1024)
+        results["step1_download"] = f"OK — {size_mb:.2f} MB"
+        print(f"[TEST-AUDIO] Download OK — {size_mb:.2f} MB")
+
+        # Step 2: Extract audio
+        audio_ok = _extract_audio(video_path, audio_path)
+
+        if not audio_ok:
+            results["step2_audio"] = "FAIL — ffmpeg could not extract audio"
+            return JSONResponse(results)
+
+        size_kb = os.path.getsize(audio_path) / 1024
+        results["step2_audio"] = f"OK — {size_kb:.1f} KB WAV at 16kHz mono"
+        print(f"[TEST-AUDIO] Audio OK — {size_kb:.1f} KB")
+
+        # Step 3: Transcribe
+        transcript = transcribe_with_timestamps(audio_path)
+
+        results["step3_transcript"] = {
+            "status":           "OK",
+            "full_text":        transcript.get("full_text", ""),
+            "segment_count":    len(transcript.get("segments", [])),
+            "seconds_mapped":   len(transcript.get("second_by_second", [])),
+            "second_by_second": transcript.get("second_by_second", [])
+        }
+        print(f"[TEST-AUDIO] Transcript OK — {len(transcript.get('full_text', ''))} chars")
+
+    except Exception as e:
+        import traceback
+        results["error"] = f"{type(e).__name__}: {str(e)}"
+        print(f"[TEST-AUDIO] Exception: {traceback.format_exc()}")
+
+    finally:
+        for path in [video_path, audio_path]:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+    return JSONResponse(results)
