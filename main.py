@@ -571,7 +571,7 @@ def analyze_video(url: str, context: str = ""):
 
         # ── Step 6: Call Claude ────────────────────────────────────
         print(f"[ANALYZE] STEP 6 — calling Claude API "
-              f"(model=claude-sonnet-4-20250514, max_tokens=3500)")
+              f"(model=claude-sonnet-4-6, max_tokens=3500)")
         print(f"[ANALYZE] STEP 6 — ANTHROPIC_API_KEY set = "
               f"{'YES (len=' + str(len(ANTHROPIC_API_KEY)) + ')' if ANTHROPIC_API_KEY else 'NO — THIS WILL FAIL'}")
 
@@ -579,7 +579,7 @@ def analyze_video(url: str, context: str = ""):
 
         try:
             response = client.messages.create(
-                model      = "claude-sonnet-4-20250514",
+                model      = "claude-sonnet-4-6",
                 max_tokens = 3500,
                 messages   = [{"role": "user", "content": content_blocks}]
             )
